@@ -58,6 +58,9 @@ add_circular(system_pthread FAT
 	SIBLINGS
 		platform system_kernel system_dyld system_c
 )
+# Match the upstream Xcode alias list for the Darwin compatibility names.
+set_property(TARGET system_pthread APPEND_STRING PROPERTY LINK_FLAGS
+	" -Wl,-alias_list,${CMAKE_CURRENT_SOURCE_DIR}/../xcodescripts/pthread.aliases")
 #target_link_libraries(system_pthread system_kernel platform)
 #make_fat(system_pthread)
 

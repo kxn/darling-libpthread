@@ -51,6 +51,19 @@
 
 #include "internal.h"
 
+#define PTHREAD_WORKGROUP_SPI 1
+#include "pthread/workgroup_private.h"
+
+#ifndef WQ_FLAG_THREAD_COOPERATIVE
+#define WQ_FLAG_THREAD_COOPERATIVE 0x01000000
+#endif
+#ifndef _PTHREAD_PRIORITY_COOPERATIVE_FLAG
+#define _PTHREAD_PRIORITY_COOPERATIVE_FLAG 0x08000000
+#endif
+#ifndef WQOPS_QUEUE_REQTHREADS2
+#define WQOPS_QUEUE_REQTHREADS2 0x30
+#endif
+
 #include <stdlib.h>
 #include <errno.h>
 #include <signal.h>
@@ -1524,6 +1537,33 @@ pthread_create_suspended_np(pthread_t *thread, const pthread_attr_t *attr,
 	return _pthread_create(thread, attr, start_routine, arg, flags);
 }
 
+// Workgroup membership is implemented by the registered libdispatch provider.
+static const struct pthread_workgroup_functions_s *_pthread_workgroup_functions;
+
+void
+pthread_install_workgroup_functions_np(
+		const struct pthread_workgroup_functions_s *pwgf)
+{
+	if (_pthread_workgroup_functions) {
+		PTHREAD_CLIENT_CRASH((uintptr_t)_pthread_workgroup_functions,
+				"workgroup functions already installed");
+	}
+
+	_pthread_workgroup_functions = pwgf;
+}
+
+int
+pthread_create_with_workgroup_np(pthread_t *thread, os_workgroup_t wg,
+		const pthread_attr_t *attr, void *(*start_routine)(void *), void *arg)
+{
+	if (!_pthread_workgroup_functions) {
+		PTHREAD_CLIENT_CRASH(0, "workgroup functions not yet installed");
+	}
+
+	return _pthread_workgroup_functions->pwgf_create_with_workgroup(thread, wg,
+			attr, start_routine, arg);
+}
+
 int
 pthread_detach(pthread_t thread)
 {
@@ -2234,8 +2274,7 @@ _pthread_bsdthread_init(struct _pthread_registration_data *data)
 	if (rv > 0) {
 		int required_features =
 				PTHREAD_FEATURE_FINEPRIO |
-				PTHREAD_FEATURE_BSDTHREADCTL |
-				PTHREAD_FEATURE_SETSELF |
+				/* Darling does not implement the complete BSDTHREAD_CTL ABI. */
 				PTHREAD_FEATURE_QOS_MAINTENANCE |
 				PTHREAD_FEATURE_QOS_DEFAULT;
 #ifdef DARLING
@@ -2416,6 +2455,10 @@ _pthread_wqthread(pthread_t self, mach_port_t kport, void *stacklowaddr,
 		(*__libdispatch_keventfunction)(&self->arg, &self->wq_nevents);
 		__workq_kernreturn(WQOPS_THREAD_KEVENT_RETURN, self->arg, self->wq_nevents, 0);
 	} else {
+		// Cooperative is a dispatch callback flag, not the thread TSD QoS.
+		if (flags & WQ_FLAG_THREAD_COOPERATIVE) {
+			pp |= _PTHREAD_PRIORITY_COOPERATIVE_FLAG;
+		}
 		self->fun = (void *(*)(void*))__libdispatch_workerfunction;
 		self->arg = (void *)(uintptr_t)pp;
 		self->wq_nevents = 0;
@@ -2445,6 +2488,30 @@ pthread_workqueue_setdispatchoffset_np(int offset)
 {
 	__workq_kernreturn(WQOPS_QUEUE_NEWSPISUPP, NULL, offset, 0x00);
 }
+
+#ifdef DARLING
+/* The Linux event backend supplies readiness; this ordinary detached pthread
+ * pumps it into the registered Darwin kevent worker callback. It does not
+ * require a display, a simulator UI or a separate process.
+ */
+extern int kevent_qos(int, const struct kevent_qos_s *, int,
+		struct kevent_qos_s *, int, void *, size_t *, unsigned int);
+static void *
+_darling_workqueue_event_pump(void *unused)
+{
+	struct kevent_qos_s events[WORKQ_KEVENT_EVENT_BUFFER_LEN];
+	int changes = 0;
+	for (;;) {
+		int count = kevent_qos(-1, changes ? events : NULL, changes,
+			events, WORKQ_KEVENT_EVENT_BUFFER_LEN, NULL, NULL, KEVENT_FLAG_WORKQ);
+		if (count < 0) {
+			if (errno == EINTR) continue;
+			PTHREAD_INTERNAL_CRASH(errno, "Darling workqueue event pump failed");
+		}
+		changes = count;
+	}
+}
+#endif
 
 int
 pthread_workqueue_setup(struct pthread_workqueue_config *cfg, size_t cfg_size)
@@ -2501,7 +2568,22 @@ pthread_workqueue_setup(struct pthread_workqueue_config *cfg, size_t cfg_size)
 			if (__is_threaded == 0) {
 				__is_threaded = 1;
 			}
-
+#ifdef DARLING
+			if ((__pthread_supported_features & WORKQ_FEATURE_KEVENT) && cfg->kevent_cb) {
+				pthread_t pump;
+				pthread_attr_t attr;
+				pthread_attr_init(&attr);
+				pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+				rv = pthread_create(&pump, &attr, _darling_workqueue_event_pump, NULL);
+				pthread_attr_destroy(&attr);
+				if (rv) {
+					__libdispatch_keventfunction = NULL;
+					__libdispatch_workloopfunction = NULL;
+					__libdispatch_workerfunction = NULL;
+					return rv;
+				}
+			}
+#endif
 			return 0;
 		}
 	}
@@ -2636,6 +2718,26 @@ _pthread_workqueue_addthreads(int numthreads, pthread_priority_t priority)
 		res = errno;
 	}
 	return res;
+}
+
+int
+_pthread_workqueue_add_cooperativethreads(int numthreads, pthread_priority_t priority)
+{
+	if (__libdispatch_workerfunction == NULL) {
+		return EPERM;
+	}
+	int res = __workq_kernreturn(WQOPS_QUEUE_REQTHREADS2, NULL, numthreads, (int)priority);
+	return res == -1 ? errno : res;
+}
+
+int
+_pthread_workqueue_allow_send_signals(int preserve_signum)
+{
+	// This backend does not yet implement Darwin workqueue signal opt-in.
+	// Do not forward to the legacy bsdthread_ctl catch-all success stub.
+	(void)preserve_signum;
+	errno = ENOTSUP;
+	return -1;
 }
 
 int
