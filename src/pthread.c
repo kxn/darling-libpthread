@@ -2569,6 +2569,14 @@ pthread_workqueue_setup(struct pthread_workqueue_config *cfg, size_t cfg_size)
 				__is_threaded = 1;
 			}
 #ifdef DARLING
+			if ((__pthread_supported_features & WORKQ_FEATURE_KEVENT) && cfg->workloop_cb) {
+				if (__workq_kernreturn(0x100022 /* paired workloop callback registration */, NULL, 1, 0) == -1) {
+					__libdispatch_keventfunction = NULL;
+					__libdispatch_workloopfunction = NULL;
+					__libdispatch_workerfunction = NULL;
+					return errno;
+				}
+			}
 			if ((__pthread_supported_features & WORKQ_FEATURE_KEVENT) && cfg->kevent_cb) {
 				pthread_t pump;
 				pthread_attr_t attr;
